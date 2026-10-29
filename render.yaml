@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: wdcodex-relay
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: node --check server.mjs
+    startCommand: node server.mjs
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: UPSTREAM_ORIGIN
+        sync: false
