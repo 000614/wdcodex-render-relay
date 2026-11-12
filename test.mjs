@@ -19,7 +19,7 @@ function request(url,path='/',headers={},body='',method=body?'POST':'GET'){
 }
 test('health is local, fixed target cannot be chosen by path or browser headers',async t=>{
  let hits=0;const {url}=await fixture(t,(req,res)=>{hits++;res.end('fixed');});
- assert.equal((await request(url,'/healthz')).status,200);assert.equal(hits,0);
+ const health=await request(url,'/healthz');assert.equal(health.status,200);assert.equal(JSON.parse(health.body).remoteWebSocket,true);assert.equal(hits,0);
  assert.equal((await request(url,'//evil.example/')).status,400);
  assert.equal((await request(url,'/',{host:'evil.example'})).status,403);
  assert.equal((await request(url,'/api/local/shutdown',{origin:site},'{}')).status,403);assert.equal(hits,0);

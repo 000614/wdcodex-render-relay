@@ -32,7 +32,7 @@ export function createRelay({upstreamOrigin,publicOrigin,allowInsecureLoopback=f
     if(target.origin!==site.origin)return error(res,400,'无效目标');
     if(target.pathname==='/healthz'){
       if(req.method!=='GET'&&req.method!=='HEAD')return error(res,405,'不支持此方法');
-      res.writeHead(200,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(req.method==='HEAD'?'':JSON.stringify({ok:true,service:'wdcodex-relay'}));return;
+      res.writeHead(200,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(req.method==='HEAD'?'':JSON.stringify({ok:true,service:'wdcodex-relay',remoteWebSocket:true}));return;
     }
     // The host's shutdown/control endpoints are never exposed through this relay.
     if(target.pathname==='/api/local'||target.pathname.startsWith('/api/local/'))return error(res,403,'仅限主机本地操作');
