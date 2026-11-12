@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
 import {createHash} from 'node:crypto';
 import {createRelay} from './server.mjs';
 
@@ -52,6 +53,13 @@ test('large request bodies are rejected and upstream secrets are never redirecte
  assert.equal((await request(url,'/',{origin:site},'x'.repeat(262145))).status,413);
  assert.equal((await request(url)).status,502);
 });
+test('screenshot turns pass the larger body limit while other routes remain capped',async t=>{
+ let received=0;const {url}=await fixture(t,async(req,res)=>{for await(const chunk of req)received+=chunk.length;res.end('ok');});
+ const payload='x'.repeat(300000);
+ assert.equal((await request(url,'/api/threads/abc/turn',{origin:site},payload)).status,200);
+ assert.equal(received,payload.length);
+ assert.equal((await request(url,'/api/threads',{origin:site},payload)).status,413);
+});
 test('upstream same-site redirects rebase to relay and connection-specific headers are dropped',async t=>{
  let destination;const {url,upstreamOrigin}=await fixture(t,(req,res)=>{res.writeHead(302,{Location:destination,Connection:'x-secret','x-secret':'do-not-pass'});res.end();});destination=upstreamOrigin+'/next?q=1';
  const r=await request(url);assert.equal(r.headers.location,site+'/next?q=1');assert.equal(r.headers['x-secret'],undefined);assert.equal(r.headers['cache-control'],'no-store');
@@ -60,4 +68,28 @@ test('production validates HTTPS origins and rejects loops and embedded credenti
  assert.throws(()=>createRelay({upstreamOrigin:'http://example.com',publicOrigin:site}),/HTTPS/);
  assert.throws(()=>createRelay({upstreamOrigin:site,publicOrigin:site}),/itself/);
  assert.throws(()=>createRelay({upstreamOrigin:'https://user:secret@example.com',publicOrigin:site}),/Origin/);
+});
+test('remote desktop cookies pass only on its path',async t=>{
+ let got;const {url}=await fixture(t,(req,res)=>{got=req.headers.cookie;res.setHeader('Set-Cookie',['mesh_session=abc; Path=/remote/; HttpOnly','codex_web=xyz; Path=/']);res.end();});
+ const r=await request(url,'/remote/',{cookie:'codex_web=old; mesh_session=abc'});
+ assert.equal(got,'codex_web=old; mesh_session=abc');assert.equal(r.headers['set-cookie'].length,2);
+ const normal=await request(url,'/',{cookie:'codex_web=old; mesh_session=abc'});
+ assert.equal(got,'codex_web=old');assert.equal(normal.headers['set-cookie'].length,1);
+});
+test('websocket upgrade is restricted to same-origin remote desktop',async t=>{
+ const upstream=http.createServer();let seen;
+ upstream.on('upgrade',(req,socket)=>{seen=req.headers;socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');socket.write('hello');socket.end();});
+ const upstreamOrigin=await listen(upstream);
+ const relay=createRelay({upstreamOrigin,publicOrigin:site,allowInsecureLoopback:true});const url=await listen(relay);
+ t.after(()=>{relay.dispose();upstream.closeAllConnections();upstream.close();});
+ async function upgrade(path,origin){return await new Promise((resolve,reject)=>{
+   const socket=net.connect(Number(new URL(url).port),'127.0.0.1');let data='';
+   socket.on('connect',()=>socket.write(`GET ${path} HTTP/1.1\r\nHost: ${new URL(site).host}\r\nOrigin: ${origin}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nCookie: codex_web=ok; mesh_session=abc\r\n\r\n`));
+   socket.on('data',chunk=>{data+=chunk.toString();if(data.includes('hello')||data.includes('403'))socket.end();});
+   socket.on('close',()=>resolve(data));socket.on('error',reject);
+ });}
+ assert.match(await upgrade('/api/events',site),/403 Forbidden/);
+ assert.match(await upgrade('/remote/meshrelay.ashx','https://evil.example'),/403 Forbidden/);
+ assert.match(await upgrade('/remote/meshrelay.ashx',site),/101 Switching Protocols/);
+ assert.equal(seen.origin,upstreamOrigin);assert.equal(seen.cookie,'codex_web=ok; mesh_session=abc');
 });

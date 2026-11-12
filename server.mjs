@@ -38,9 +38,11 @@ export function createRelay({upstreamOrigin,publicOrigin,allowInsecureLoopback=f
     if(target.pathname==='/api/local'||target.pathname.startsWith('/api/local/'))return error(res,403,'仅限主机本地操作');
     if(req.headers.origin&&req.headers.origin!==site.origin)return error(res,403,'来源不被允许');
     if(req.method==='POST'&&req.headers.origin!==site.origin)return error(res,403,'缺少同源验证');
-    if(Number(req.headers['content-length']||0)>maxBodyBytes)return error(res,413,'请求过大');
+    const bodyLimit=req.method==='POST'&&/^\/api\/threads\/[^/]+\/turn$/.test(target.pathname)?Math.max(maxBodyBytes,23000000):maxBodyBytes;
+    if(Number(req.headers['content-length']||0)>bodyLimit)return error(res,413,'请求过大');
     const headers={};for(const name of REQUEST_HEADERS)if(req.headers[name]!==undefined)headers[name]=req.headers[name];
-    const cookies=(req.headers.cookie||'').split(';').map(s=>s.trim()).filter(s=>s.startsWith('codex_web='));
+    const remote=target.pathname==='/remote'||target.pathname.startsWith('/remote/');
+    const cookies=(req.headers.cookie||'').split(';').map(s=>s.trim()).filter(s=>remote||s.startsWith('codex_web='));
     if(cookies.length)headers.cookie=cookies.join('; ');
     // The HTTPS tunnel terminator supplies X-Forwarded-Proto itself. Supplying
     // another value here would let some tunnels append "https, https" and
@@ -57,7 +59,7 @@ export function createRelay({upstreamOrigin,publicOrigin,allowInsecureLoopback=f
         if(destination.origin!==upstream.origin){incoming.destroy();error(res,502,'上游返回了非工作台跳转');return;}
         responseHeaders.location=site.origin+destination.pathname+destination.search+destination.hash;
       }
-      const setCookies=(incoming.headers['set-cookie']||[]).filter(c=>c.startsWith('codex_web=')).map(c=>{
+      const setCookies=(incoming.headers['set-cookie']||[]).filter(c=>remote||c.startsWith('codex_web=')).map(c=>{
         let value=c.replace(/;\s*Domain=[^;]*/ig,'');if(!/;\s*Secure(?:;|$)/i.test(value))value+='; Secure';return value;
       });
       if(setCookies.length)responseHeaders['set-cookie']=setCookies;
@@ -67,13 +69,36 @@ export function createRelay({upstreamOrigin,publicOrigin,allowInsecureLoopback=f
     });
     out.setTimeout(idleTimeout,()=>out.destroy(new Error('upstream idle timeout')));
     out.on('error',()=>error(res,502,'本机工作台暂不可达，请确认家中电脑和隧道已启动'));
-    let size=0;const limiter=new Transform({transform(chunk,encoding,callback){size+=chunk.length;if(size>maxBodyBytes){callback(Object.assign(Error('body too large'),{status:413}));return;}callback(null,chunk);}});
+    let size=0;const limiter=new Transform({transform(chunk,encoding,callback){size+=chunk.length;if(size>bodyLimit){callback(Object.assign(Error('body too large'),{status:413}));return;}callback(null,chunk);}});
     limiter.on('error',()=>{error(res,413,'请求过大');out.destroy();});req.on('error',()=>out.destroy());
     res.on('close',()=>out.destroy());req.pipe(limiter).pipe(out);
   });
   server.requestTimeout=30000;server.headersTimeout=10000;
   server.on('connection',socket=>{sockets.add(socket);socket.on('close',()=>sockets.delete(socket));});
-  server.on('upgrade',(req,socket)=>{socket.end('HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n');});
+  server.on('upgrade',(req,socket,head)=>{
+    let target;try{target=new URL(req.url,site);}catch{socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');return;}
+    if(req.headers.host!==site.host||target.origin!==site.origin||!(target.pathname==='/remote'||target.pathname.startsWith('/remote/'))||req.headers.origin!==site.origin){
+      socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');return;
+    }
+    const headers={host:upstream.host,connection:'Upgrade',upgrade:'websocket','sec-websocket-key':req.headers['sec-websocket-key'],
+      'sec-websocket-version':req.headers['sec-websocket-version'],origin:upstream.origin,'ngrok-skip-browser-warning':'1'};
+    if(req.headers['sec-websocket-protocol'])headers['sec-websocket-protocol']=req.headers['sec-websocket-protocol'];
+    if(req.headers['sec-websocket-extensions'])headers['sec-websocket-extensions']=req.headers['sec-websocket-extensions'];
+    if(req.headers.cookie)headers.cookie=req.headers.cookie;
+    const out=transport.request(upstream.origin+target.pathname+target.search,{method:'GET',headers});
+    out.on('upgrade',(incoming,peer,peerHead)=>{
+      const lines=[`HTTP/1.1 ${incoming.statusCode} ${incoming.statusMessage||'Switching Protocols'}`];
+      for(const [name,value] of Object.entries(incoming.headers))if(value!==undefined)lines.push(`${name}: ${value}`);
+      socket.write(lines.join('\r\n')+'\r\n\r\n');
+      if(head.length)peer.write(head);if(peerHead.length)socket.write(peerHead);
+      socket.pipe(peer);peer.pipe(socket);
+      socket.on('error',()=>peer.destroy());peer.on('error',()=>socket.destroy());
+      socket.on('close',()=>peer.destroy());peer.on('close',()=>socket.destroy());
+    });
+    out.on('response',incoming=>{socket.end(`HTTP/1.1 ${incoming.statusCode||502} Bad Gateway\r\nConnection: close\r\n\r\n`);incoming.resume();});
+    out.on('error',()=>socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n'));
+    out.end();
+  });
   server.on('connect',(req,socket)=>socket.end('HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n'));
   server.dispose=()=>{for(const s of sockets)s.destroy();server.close();};
   return server;
